@@ -35,17 +35,20 @@ type Devices = HashMap<Address, Device>;
 struct Device {
     mac_addr: Address,
     name: String,
+    is_connected: bool,
 }
 
 struct BluerClient {
     session: Session,
     rt: Runtime,
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum Command {
     RefreshDevices,
     GetCurrentDevices,
     StopRefreshDevices,
+    DisconnectDevice(String),
+    ConnectDevice(String),
 }
 
 struct AppState {
@@ -72,6 +75,21 @@ fn get_devices(state: tauri::State<AppState>) -> Vec<Device> {
 #[tauri::command]
 fn get_device_state(state: tauri::State<AppState>) {}
 
+#[tauri::command(rename_all = "snake_case")]
+fn disconnect_device(mac_addr: String, state: tauri::State<AppState>) -> bool {
+    println!("disconnect command");
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            state
+                .background_controller_tx
+                .send(Command::DisconnectDevice(mac_addr))
+                .await
+                .is_ok()
+        })
+}
+
 #[tauri::command]
 fn refresh_devices(state: tauri::State<AppState>) -> bool {
     tokio::runtime::Builder::new_current_thread()
@@ -84,6 +102,34 @@ fn refresh_devices(state: tauri::State<AppState>) -> bool {
                 .await
                 .is_ok()
         })
+}
+
+#[tauri::command(rename_all = "snake_case")]
+fn connect_device(mac_addr: String, state: tauri::State<AppState>) -> bool {
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async {
+            state
+                .background_controller_tx
+                .send(Command::ConnectDevice(mac_addr))
+                .await
+                .is_ok()
+        })
+}
+
+fn str_to_mac_addr(s: &str) -> Result<Address, ()> {
+    let result_vec: Vec<_> = s
+        .split(":")
+        .map(|sub| u8::from_str_radix(sub, 16))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {})?;
+    if result_vec.len() == 6 {
+        let u8_array = <Vec<u8> as TryInto<[u8; 6]>>::try_into(result_vec).unwrap();
+        Ok(Address::new(u8_array))
+    } else {
+        Err(())
+    }
 }
 
 fn systme_tray_event(app: &AppHandle, event: SystemTrayEvent) {
@@ -138,13 +184,17 @@ mod system_tray_menu_item {
     }
 }
 
-fn background_thread(devices_ref: Arc<Mutex<Devices>>, rx_command: Receiver<Command>) {
+fn background_thread(
+    devices_ref: Arc<Mutex<Devices>>,
+    rx_command: Receiver<Command>,
+    app: AppHandle,
+) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .expect("failed to make a tokio runtime");
 
-    rt.block_on(blockground_procedure(devices_ref, rx_command));
+    rt.block_on(blockground_procedure(devices_ref, rx_command, app));
 }
 
 async fn handle_adapter_event(
@@ -154,7 +204,6 @@ async fn handle_adapter_event(
 ) {
     match e {
         AdapterEvent::DeviceAdded(addr) => {
-            println!("device added: {}", addr);
             let device = match adapter.lock().await.device(addr) {
                 Err(e) => return,
                 Ok(d) => d,
@@ -168,32 +217,33 @@ async fn handle_adapter_event(
                         .await
                         .unwrap_or_default()
                         .unwrap_or("unknown".to_string()),
+                    is_connected: device.is_connected().await.unwrap_or_default(),
                 },
             );
         }
         AdapterEvent::DeviceRemoved(addr) => {
-            println!("device removed: {}", addr);
             devices_ref.lock().await.remove(&addr);
         }
-        AdapterEvent::PropertyChanged(p) => {}
+        AdapterEvent::PropertyChanged(p) => {
+            println!("propertyChanged: {:?}", p);
+        }
     }
 }
 
 async fn blockground_procedure(
     devices_ref: Arc<Mutex<Devices>>,
     mut rx_command: Receiver<Command>,
+    app: AppHandle,
 ) {
     let session = Session::new().await.unwrap();
     let adapter = Arc::new(Mutex::new(session.default_adapter().await.unwrap()));
 
     let is_refresh_devices = Arc::new(Mutex::new(false));
     loop {
-        println!("in loop");
         let c = match rx_command.recv().await {
             Some(c) => c,
             None => return,
         };
-        println!("command: {:?}", c);
         let mut backgound_handlers = vec![];
         match c {
             Command::RefreshDevices => {
@@ -206,7 +256,6 @@ async fn blockground_procedure(
                         *is_refresh_devices_guard = true;
                     }
                 }
-                println!("before: thread spawn");
                 let devices_ref_tmp = devices_ref.clone();
                 let is_refresh_devices_tmp = is_refresh_devices.clone();
                 let adapter_tmp = adapter.clone();
@@ -219,6 +268,34 @@ async fn blockground_procedure(
             }
             Command::GetCurrentDevices => {}
             Command::StopRefreshDevices => {}
+            Command::DisconnectDevice(mac_addr) => {
+                let addr = match str_to_mac_addr(&mac_addr) {
+                    Ok(addr) => addr,
+                    Err(_) => continue,
+                };
+                let device = match adapter.lock().await.device(addr) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                if device.disconnect().await.is_ok() {
+                    let _ = app.emit_all("update_devices", ());
+                } else {
+                }
+            }
+            Command::ConnectDevice(mac_addr) => {
+                let addr = match str_to_mac_addr(&mac_addr) {
+                    Ok(addr) => addr,
+                    Err(_) => continue,
+                };
+                let device = match adapter.lock().await.device(addr) {
+                    Ok(d) => d,
+                    Err(_) => continue,
+                };
+                if device.connect().await.is_ok() {
+                    let _ = app.emit_all("update_devices", ());
+                } else {
+                }
+            }
         }
     }
 }
@@ -228,7 +305,6 @@ async fn refresh_devices_background(
     is_refresh_devices: Arc<Mutex<bool>>,
     adapter: Arc<Mutex<Adapter>>,
 ) {
-    println!("before is_discovering");
     let is_discovering = match adapter.lock().await.is_discovering().await {
         Ok(b) => b,
         Err(e) => {
@@ -236,7 +312,6 @@ async fn refresh_devices_background(
             return;
         }
     };
-    println!("after is_discovering");
     let filter = DiscoveryFilter {
         transport: DiscoveryTransport::Auto,
         ..Default::default()
@@ -249,14 +324,11 @@ async fn refresh_devices_background(
         .unwrap();
     if !is_discovering {
         let _ = match adapter.lock().await.discover_devices().await {
-            Ok(e) => {}
-            Err(e) => {}
+            Ok(_) => {}
+            Err(_) => {}
         };
     }
-    println!("before appending exists devices");
     append_exists_devices(devices_ref.clone(), adapter.clone()).await;
-    println!("after appending exists devices");
-    println!("length of devices: {}", devices_ref.lock().await.len());
     let mut events = adapter.lock().await.events().await.unwrap();
     loop {
         if !*is_refresh_devices.lock().await {
@@ -289,6 +361,7 @@ async fn append_exists_devices(devices_ref: Arc<Mutex<Devices>>, adapter: Arc<Mu
                     .await
                     .unwrap_or_default()
                     .unwrap_or("unknown".to_string()),
+                is_connected: device.is_connected().await.unwrap_or_default(),
             },
         );
     }
@@ -300,9 +373,6 @@ fn main() {
         background_controller_tx: tx,
     };
     let devices_ref = state.devices.clone();
-    thread::spawn(move || {
-        background_thread(devices_ref, rx);
-    });
     let quit = CustomMenuItem::new(
         system_tray_menu_item::id::QUIT,
         system_tray_menu_item::title::QUIT,
@@ -327,7 +397,10 @@ fn main() {
     let system_tray = SystemTray::new().with_menu(tray_menu);
     tauri::Builder::default()
         .setup(|app| {
-            app.emit_all("", ()).unwrap();
+            let app_handle = app.app_handle();
+            thread::spawn(move || {
+                background_thread(devices_ref, rx, app_handle);
+            });
             Ok(())
         })
         .system_tray(system_tray)
@@ -335,7 +408,9 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             get_devices,
             refresh_devices,
-            get_device_state
+            get_device_state,
+            disconnect_device,
+            connect_device
         ])
         .on_system_tray_event(systme_tray_event)
         .on_window_event(|event| match event.event() {

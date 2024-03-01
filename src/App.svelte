@@ -1,41 +1,45 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/tauri";
-  class Device{
-    mac_addr: string;
-    name: string;
-    constructor(mac_addr: string, name: string){
-      this.mac_addr = mac_addr;
-      this.name = name;
-    }
-  }
+  import { Device } from "./lib/device";
+  import DeviceElement from "./lib/DeviceElement.svelte";
+  import { listen } from "@tauri-apps/api/event";
+  import { onMount } from "svelte";
   let devices: Device[] = [];
   function get_devices() {
     invoke("get_devices", {}).then((result) => {
+      devices = [];
       (result as Device[]).forEach((o) => {
-        console.log(o);
-        devices.push(new Device(o.mac_addr, o.name));
+        devices.push(new Device(o.mac_addr, o.name, o.is_connected));
       });
+      console.log("get_devices", devices);
       devices = devices;
     });
   }
   function refresh_devices() {
     invoke("refresh_devices", {}).then((result) => {
-      console.log("refresh_devices: ", result);
+      console.log("refresh_devices");
     });
   }
+  onMount(() => {
+    const unlisten = listen("update_devices", () => {
+      get_devices();
+    });
+  });
 </script>
 
 <main class="container">
-  <h1>devices</h1>
+  <h1 class=" text-3xl">devices</h1>
+  <button on:click={refresh_devices} class="btn"> refresh </button>
+  <button on:click={get_devices} class="btn"> get devices </button>
   <div>
     {#each devices as d}
-      { d.name }
-      { d.mac_addr }
+      <DeviceElement this_device={d} />
     {/each}
   </div>
-  <button on:click={refresh_devices}> refresh </button>
-  <button on:click={get_devices}> get devices </button>
 </main>
 
-<style>
+<style lang="postcss">
+  .btn {
+    @apply text-xl border rounded-md p-2 shadow m-2 hover:font-bold hover:shadow-lg active:translate-y-2 active:shadow-sm;
+  }
 </style>
